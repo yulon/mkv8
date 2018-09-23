@@ -1,9 +1,9 @@
 {
   "name": "mkv8",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Easily make V8 static library.",
   "bin": {
-    "mkv8": "mkv8.js"
+    "mkv8": "bin/mkv8.js"
   },
   "repository": {
     "type": "git",
