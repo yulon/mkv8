@@ -10,6 +10,7 @@ flags
 	.version('0.1.0')
 	.option('-s, --src <PATH>', 'Source PATH')
 	.option('-a, --arch <ARCH>', 'Tartget ARCH')
+	.option('-g, --gnu', 'Make GNU archive library on Windows')
 	.option('-j, --jobs <N>', 'Allow N jobs at once')
 	.parse(process.argv)
 
@@ -66,13 +67,13 @@ const verFilePath = path.join(srcDir, 'include', 'v8-version.h')
 
 const verFileData = fs.readFileSync(verFilePath).toString()
 if (verFileData === '') {
-	console.log(`Error: failed to read "${verFilePath}"!`)
+	console.error(`Error: failed to read "${verFilePath}"!`)
 	return
 }
 
 const verFileDataLines = verFileData.split('\n')
 if (verFileDataLines.length < 4) {
-	console.log(`Error: failed to parse "${verFilePath}"!`)
+	console.error(`Error: failed to parse "${verFilePath}"!`)
 	return
 }
 
@@ -100,14 +101,6 @@ for (let i = 0; i < verFileDataLines.length; i++) {
 			patchLv = nodes[2].trim()
 	}
 }
-
-var target = `v${majorVer}.${minorVer}.${buildNum}.${patchLv}-${plat}-${arch}`
-
-const outDir = path.join(srcDir, 'out.mkv8', '.original', target)
-const objDir = path.join(outDir, 'obj')
-
-const distDir = path.join(srcDir, 'out.mkv8', target)
-const libDir = path.join(distDir, 'lib')
 
 function copyNewFile(src, dest) {
 	if (
@@ -149,36 +142,61 @@ function copyIncDir(src, dest) {
 	return c
 }
 
-var chFileC = 0
-
-function copyDevFiles() {
-	chFileC += copyIncDir(path.join(srcDir, 'include'), path.join(distDir, 'include'))
-	chFileC += copyNewFile(path.join(srcDir, 'LICENSE'), path.join(distDir, 'LICENSE'))
-
-	if (chFileC === 0) {
-		console.log('Already up to date.')
-	}
-	console.log('')
-
-	console.log('=> Done (' + path.relative(srcDir, distDir) + ')')
-}
-
 ;(async () => {
 
 console.log('=> Configuring')
 
-var gn, libPrefix, libExt, ar
+var gn = 'gn'
+var gnArgs = {
+	'is_debug': false,
+	'symbol_level': 0,
+	'is_component_build': false,
+	'v8_static_library': true,
+	'v8_monolithic': true,
+	'use_custom_libcxx': false,
+	'use_custom_libcxx_for_host': false,
+	'v8_use_external_startup_data': false,
+	'treat_warnings_as_errors': false,
+	'target_cpu': `"${arch}"`
+}
+
+var origlibExt
+var distLibPrefix
+var distLibExt
+
+var ar = 'ar'
+var ranlib = 'ranlib'
+
 if (process.platform === 'win32') {
 	process.env['DEPOT_TOOLS_WIN_TOOLCHAIN'] = '0'
-	gn = 'gn.bat'
-	libPrefix = ''
-	libExt = '.lib'
-	ar = path.join(path.dirname(__dirname), 'tools', 'ar')
+	gn += '.bat'
+	origlibExt = '.lib'
+	if (flags.gnu) {
+		console.error(`Error: "-g, --gnu" is not completed yet!`)
+		return
+
+		plat += '-gnu'
+		distLibPrefix = 'lib'
+		distLibExt = '.a'
+		ar = path.join(__dirname, 'tools', ar)
+		ranlib = path.join(__dirname, 'tools', ranlib)
+	} else {
+		gnArgs['is_clang'] = false
+		distLibPrefix = ''
+		distLibExt = '.lib'
+	}
 } else {
-	gn = 'gn'
-	libPrefix = 'lib'
-	libExt = '.a'
-	ar = 'ar'
+	origlibExt = '.a'
+	distLibPrefix = 'lib'
+	distLibExt = '.a'
+}
+
+const target = `v${majorVer}.${minorVer}.${buildNum}.${patchLv}-${plat}-${arch}`
+const outDir = path.join(srcDir, 'out.mkv8', '.original', target)
+
+var gnArgsStr = '--args='
+for (const key in gnArgs) {
+	gnArgsStr += ` ${key}=${gnArgs[key]}`
 }
 
 if (await exec(
@@ -186,7 +204,7 @@ if (await exec(
 	[
 		'gen',
 		outDir,
-		`--args=is_debug=false symbol_level=0 is_component_build=false v8_monolithic=true v8_use_external_startup_data=false treat_warnings_as_errors=false v8_enable_i18n_support=false target_cpu="${arch}" v8_target_cpu="${arch}"`
+		gnArgsStr
 	]
 ) !== 0) {
 	return
@@ -212,8 +230,47 @@ console.log('')
 
 console.log('=> Distributing')
 
-const thinLibPath = path.join(outDir, 'obj', 'v8_monolith') + libExt
-const rawObjPaths = cp.execFileSync(ar, ['-t', thinLibPath], {maxBuffer: 8 * 1024 * 1024}).toString().split('\n')
+const distDir = path.join(srcDir, 'out.mkv8', target)
+const distLibDir = path.join(distDir, 'lib')
+
+const origLibPath = path.join(outDir, 'obj', 'v8_monolith' + origlibExt)
+const distLibPath = path.join(distLibDir, distLibPrefix + 'v8' + distLibExt)
+
+var chFileC = 0
+
+function copyDevFiles() {
+	chFileC += copyIncDir(path.join(srcDir, 'include'), path.join(distDir, 'include'))
+
+	if (copyNewFile(path.join(srcDir, 'LICENSE'), path.join(distDir, 'LICENSE'))) {
+		chFileC++
+	}
+
+	if (chFileC === 0) {
+		console.log('Already up to date.')
+	}
+	console.log('')
+
+	console.log('=> Done (' + path.relative(srcDir, distDir) + ')')
+}
+
+if (
+	!mkdir(distLibDir) &&
+	fs.existsSync(distLibPath) &&
+	fs.statSync(origLibPath).mtimeMs <= fs.statSync(distLibPath).mtimeMs
+) {
+	copyDevFiles()
+	return
+}
+
+if (process.platform === 'win32' && !flags.gnu) {
+	if (copyNewFile(origLibPath, distLibPath)) {
+		chFileC++
+	}
+	copyDevFiles()
+	return
+}
+
+const rawObjPaths = cp.execFileSync(ar, ['-t', origLibPath], {maxBuffer: 8 * 1024 * 1024}).toString().split('\n')
 
 var objPaths = []
 for (let i = 0; i < rawObjPaths.length - 1; i++) {
@@ -229,34 +286,37 @@ if (objPaths.length <= 0) {
 	return
 }
 
-const libPath = path.join(libDir, libPrefix + 'v8' + libExt)
-
-if (
-	!mkdir(libDir) &&
-	fs.existsSync(libPath) &&
-	fs.statSync(thinLibPath).mtimeMs <= fs.statSync(libPath).mtimeMs
-) {
-	copyDevFiles()
-	return
-}
-
 var child = cp.spawn(ar, ['-M']);
-child.on('exit', function(code) {
+child.on('exit', async function(code) {
 	if (code !== 0) {
 		console.error('Error: failed to package obj files!')
 		return
 	}
 	chFileC++
-	console.log('ar:', path.relative(srcDir, thinLibPath), '->', path.relative(srcDir, libPath))
+
+	const distLibPathSht = path.relative(srcDir, distLibPath)
+	console.log('ar (thin to fat):', path.relative(srcDir, origLibPath), '->', distLibPathSht)
+
+	await exec(ranlib, [distLibPath])
+	console.log('ranlib:', distLibPathSht)
+
 	copyDevFiles()
 });
 
-child.stdin.write('CREATE ' + libPath + '\n')
-for (let i = 0; i < objPaths.length; i++) {
-	child.stdin.write('ADDMOD ' + objPaths[i] + '"\n')
+async function write(data) {
+	await new Promise((resolve) => {
+		child.stdin.write(data, () => {
+			resolve()
+		})
+	})
 }
-child.stdin.write('SAVE\n')
-child.stdin.write('END\n')
+
+await write('CREATE ' + distLibPath + '\n')
+for (let i = 0; i < objPaths.length; i++) {
+	await write('ADDMOD ' + objPaths[i] + '"\n')
+}
+await write('SAVE\n')
+await write('END\n')
 child.stdin.end()
 
 })()
